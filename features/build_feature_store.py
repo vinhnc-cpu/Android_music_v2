@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS {table}
 (
     snapshot_date                   Date,
     user_pseudo_id                  String,
+    install_date                    Date   DEFAULT toDate('1970-01-01'),
+    milestone_day                   UInt8  DEFAULT 0,
 
     -- A: Acquisition
     media_source                    String DEFAULT '',
@@ -224,6 +226,8 @@ def create_tables(client):
     for col_ddl in [
         f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS minutes_since_install Int32 DEFAULT 0 AFTER hours_since_install",
         f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS seconds_since_install Int32 DEFAULT 0 AFTER minutes_since_install",
+        f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS install_date Date DEFAULT toDate('1970-01-01') AFTER user_pseudo_id",
+        f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS milestone_day UInt8 DEFAULT 0 AFTER install_date",
     ]:
         client.command(col_ddl)
     logger.info(f"Table {tables.feature_store} ready.")
@@ -283,6 +287,8 @@ INSERT INTO {tables.feature_store}
 SELECT
     ui.idate + {M}      AS snapshot_date,
     src.user_pseudo_id,
+    ui.idate            AS install_date,
+    toUInt8({M})        AS milestone_day,
 
     -- A: Acquisition
     ifNull(argMaxIf(src.up_af_media_source, src.event_timestamp,
@@ -679,14 +685,15 @@ def build_milestone_snapshot(
 
     snapshot_date range: [install_from + milestone, install_to + milestone]
     """
-    snap_from = (date.fromisoformat(install_from) + timedelta(days=milestone)).isoformat()
-    snap_to   = (date.fromisoformat(install_to)   + timedelta(days=milestone)).isoformat()
-    label     = f"D{milestone:02d} [{install_from}→{install_to}]"
+    label = f"D{milestone:02d} [{install_from}→{install_to}]"
 
+    # Check/delete by (install_date, milestone_day) — chính xác theo cohort,
+    # tránh nhầm lẫn khi nhiều milestones share cùng snapshot_date trong daily build.
     existing = client.query(
         f"SELECT count() FROM {tables.feature_store} FINAL "
-        f"WHERE snapshot_date >= toDate('{snap_from}') "
-        f"  AND snapshot_date <= toDate('{snap_to}')"
+        f"WHERE install_date >= toDate('{install_from}') "
+        f"  AND install_date <= toDate('{install_to}') "
+        f"  AND milestone_day = {milestone}"
     ).result_rows[0][0]
 
     if existing > 0 and not force and not dry_run:
@@ -696,8 +703,9 @@ def build_milestone_snapshot(
     if existing > 0 and not dry_run:
         client.command(
             f"ALTER TABLE {tables.feature_store} "
-            f"DELETE WHERE snapshot_date >= toDate('{snap_from}') "
-            f"         AND snapshot_date <= toDate('{snap_to}')",
+            f"DELETE WHERE install_date >= toDate('{install_from}') "
+            f"         AND install_date <= toDate('{install_to}') "
+            f"         AND milestone_day = {milestone}",
             settings={"mutations_sync": 1},
         )
         logger.info(f"[{label}] Deleted {existing:,} old rows")
@@ -714,13 +722,15 @@ def build_milestone_snapshot(
 
     count = client.query(
         f"SELECT count() FROM {tables.feature_store} FINAL "
-        f"WHERE snapshot_date >= toDate('{snap_from}') "
-        f"  AND snapshot_date <= toDate('{snap_to}')"
+        f"WHERE install_date >= toDate('{install_from}') "
+        f"  AND install_date <= toDate('{install_to}') "
+        f"  AND milestone_day = {milestone}"
     ).result_rows[0][0]
     label_rate = client.query(
         f"SELECT avg(label_uninstall_7d) FROM {tables.feature_store} FINAL "
-        f"WHERE snapshot_date >= toDate('{snap_from}') "
-        f"  AND snapshot_date <= toDate('{snap_to}')"
+        f"WHERE install_date >= toDate('{install_from}') "
+        f"  AND install_date <= toDate('{install_to}') "
+        f"  AND milestone_day = {milestone}"
     ).result_rows[0][0]
     logger.info(f"[{label}] Done: {count:,} users | uninstall_rate={label_rate:.1%}")
 
@@ -769,6 +779,8 @@ INSERT INTO {tables.feature_store}
 SELECT
     toDate('{s}')          AS snapshot_date,
     src.user_pseudo_id,
+    toDate(anyIf(install_date, isNotNull(install_date))) AS install_date,
+    toUInt8(0)             AS milestone_day,
 
     -- A: Acquisition
     ifNull(argMaxIf(up_af_media_source, event_timestamp,
@@ -1135,7 +1147,7 @@ def build_snapshot(client, snap: str, dry_run: bool = False, force: bool = False
     """Calendar-based snapshot (dùng cho predict pipeline)."""
     existing = client.query(
         f"SELECT count() FROM {tables.feature_store} FINAL "
-        f"WHERE snapshot_date = toDate('{snap}')"
+        f"WHERE snapshot_date = toDate('{snap}') AND milestone_day = 0"
     ).result_rows[0][0]
     if existing > 0 and not force and not dry_run:
         logger.info(f"[{snap}] Đã có {existing:,} rows, skip (dùng --force để ghi đè)")
@@ -1144,7 +1156,7 @@ def build_snapshot(client, snap: str, dry_run: bool = False, force: bool = False
     if existing > 0 and not dry_run:
         client.command(
             f"ALTER TABLE {tables.feature_store} "
-            f"DELETE WHERE snapshot_date = toDate('{snap}')",
+            f"DELETE WHERE snapshot_date = toDate('{snap}') AND milestone_day = 0",
             settings={"mutations_sync": 1},
         )
         logger.info(f"[{snap}] Deleted {existing:,} old rows")
