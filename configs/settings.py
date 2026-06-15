@@ -45,8 +45,9 @@ tables = TableConfig()
 # Model & Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-LABEL_HORIZON  = 7    # ngày dự báo uninstall
-FEATURE_WINDOW = 30   # ngày lịch sử để tính feature
+LABEL_HORIZON       = 7    # ngày dự báo uninstall
+FEATURE_WINDOW      = 30   # ngày lịch sử để tính feature
+MAX_INSTALL_AGE_DAYS = 30  # chỉ dự đoán user cài trong 30 ngày gần nhất (D0-D30 early-churn)
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
 
@@ -153,3 +154,7 @@ NUMERICAL_FEATURES: List[str] = [
 
 ALL_FEATURES = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
 LABEL_COL    = "label_uninstall_7d"
+
+# Metric dùng để chọn model tối ưu sau training
+# auc_pr tốt hơn auc_roc khi label rate thấp (~25.8%)
+MODEL_SELECTION_METRIC: str = "auc_pr"

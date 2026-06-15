@@ -6,6 +6,7 @@ Cách dùng:
   python -m prediction.predict --snapshot_date 2026-06-15
 """
 import argparse
+import json
 import logging
 from datetime import date, timedelta
 
@@ -20,6 +21,22 @@ from configs.settings import (
 from features.build_feature_store import get_client, build_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+def _load_best_model(model_dir) -> str:
+    """Đọc model_selection.json để lấy tên model tốt nhất.
+
+    Fallback theo thứ tự lgbm → xgb → catboost nếu file chưa tồn tại.
+    """
+    sel_path = model_dir / "model_selection.json"
+    if sel_path.exists():
+        sel = json.loads(sel_path.read_text())
+        return sel["best_model"]
+    for mtype, ext in [("lgbm", ".txt"), ("xgb", ".json"), ("catboost", ".cbm")]:
+        if (model_dir / f"production_{mtype}{ext}").exists():
+            return mtype
+    raise RuntimeError(f"Không tìm thấy model trong {model_dir}")
+
 
 _DDL_PREDICTIONS = f"""
 CREATE TABLE IF NOT EXISTS {tables.predictions}
@@ -91,6 +108,9 @@ def predict(snap: str):
     client = get_client()
     client.command(_DDL_PREDICTIONS)
 
+    best_model = _load_best_model(MODEL_DIR)
+    logger.info(f"[predict] Selected model: {best_model}")
+
     # Build features nếu chưa có
     existing = client.query(
         f"SELECT count() FROM {tables.feature_store} FINAL "
@@ -126,32 +146,38 @@ def predict(snap: str):
         if cb_path.exists():
             m = CatBoostClassifier()
             m.load_model(str(cb_path))
-            preds["cb"] = m.predict_proba(X.values)[:, 1]
-            logger.info(f"[predict] CB   mean_prob={preds['cb'].mean():.3f}")
+            preds["catboost"] = m.predict_proba(X.values)[:, 1]
+            logger.info(f"[predict] CB   mean_prob={preds['catboost'].mean():.3f}")
     except ImportError:
         pass
 
     if not preds:
         raise RuntimeError("Không tìm thấy model trong " + str(MODEL_DIR))
 
-    avg_prob = np.mean(list(preds.values()), axis=0)
+    # Dùng best model; fallback nếu best không load được
+    if best_model not in preds:
+        fallback = next(iter(preds))
+        logger.warning(f"[predict] {best_model} không có, fallback → {fallback}")
+        best_model = fallback
+    primary_prob = preds[best_model]
+    logger.info(f"[predict] Primary ({best_model}) mean_prob={primary_prob.mean():.3f}")
 
     result_df = pd.DataFrame({
-        "prediction_date":    snap,
-        "user_pseudo_id":     user_ids,
-        "uninstall_prob_lgbm": preds.get("lgbm", np.full(len(user_ids), -1.0)),
-        "uninstall_prob_xgb":  preds.get("xgb",  np.full(len(user_ids), -1.0)),
-        "uninstall_prob_cb":   preds.get("cb",   np.full(len(user_ids), -1.0)),
-        "uninstall_prob_avg":  avg_prob,
-        "risk_segment":        [risk_segment(p) for p in avg_prob],
+        "prediction_date":     snap,
+        "user_pseudo_id":      user_ids,
+        "uninstall_prob_lgbm": preds.get("lgbm",     np.full(len(user_ids), -1.0)),
+        "uninstall_prob_xgb":  preds.get("xgb",      np.full(len(user_ids), -1.0)),
+        "uninstall_prob_cb":   preds.get("catboost",  np.full(len(user_ids), -1.0)),
+        "uninstall_prob_avg":  primary_prob,
+        "risk_segment":        [risk_segment(p) for p in primary_prob],
     })
 
     seg_dist = result_df["risk_segment"].value_counts()
     logger.info(f"[predict] Risk distribution:\n{seg_dist.to_string()}")
     logger.info(
         f"[predict] high+very_high: "
-        f"{(avg_prob >= 0.5).sum():,} / {len(avg_prob):,} "
-        f"({(avg_prob >= 0.5).mean():.1%})"
+        f"{(primary_prob >= 0.5).sum():,} / {len(primary_prob):,} "
+        f"({(primary_prob >= 0.5).mean():.1%})"
     )
 
     client.insert_df(tables.predictions, result_df)

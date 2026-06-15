@@ -20,7 +20,7 @@ import clickhouse_connect
 
 from configs.settings import (
     ch, tables, TOP_SCREENS, TOP_BUTTONS,
-    LABEL_HORIZON, FEATURE_WINDOW,
+    LABEL_HORIZON, FEATURE_WINDOW, MAX_INSTALL_AGE_DAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,14 +291,16 @@ SELECT
         platform IS NOT NULL AND event_date < toDate('{s}')), '')    AS platform,
 
     -- D: Install
+    -- anyIf thay vì min() để tránh bị ảnh hưởng bởi filter event_date >= snap-30;
+    -- install_date là thuộc tính cố định của user, có mặt trên mọi row.
     toInt32(dateDiff('day',
-        toDate(min(install_date)), toDate('{s}')))       AS days_since_install,
+        toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')))       AS days_since_install,
     toInt32(dateDiff('hour',
-        toDateTime(toDate(min(install_date))),
+        toDateTime(toDate(anyIf(install_date, isNotNull(install_date)))),
         toDateTime(toDate('{s}'))))                      AS hours_since_install,
-    toUInt8(toDate(min(install_date)) = toDate('{s}') - 1) AS is_day0_user,
-    toUInt8(dateDiff('day', toDate(min(install_date)), toDate('{s}')) = 1)  AS is_day1_user,
-    toUInt8(dateDiff('day', toDate(min(install_date)), toDate('{s}')) <= 7) AS is_week1_user,
+    toUInt8(toDate(anyIf(install_date, isNotNull(install_date))) = toDate('{s}') - 1) AS is_day0_user,
+    toUInt8(dateDiff('day', toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')) = 1)  AS is_day1_user,
+    toUInt8(dateDiff('day', toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')) <= 7) AS is_week1_user,
 
     -- E: Session
     toUInt32(countDistinctIf(unique_session_id,
@@ -618,7 +620,8 @@ FROM {source_table} src
 WHERE src.event_date >= toDate('{s}') - {FEATURE_WINDOW}
   AND src.event_date < toDate('{s}') + {LABEL_HORIZON}
 GROUP BY src.user_pseudo_id
-HAVING countIf(event_date < toDate('{s}')) > 0
+HAVING toDate(anyIf(install_date, isNotNull(install_date))) >= toDate('{s}') - {MAX_INSTALL_AGE_DAYS}
+   AND toDate(anyIf(install_date, isNotNull(install_date))) <= toDate('{s}')
 """
 
 
@@ -640,7 +643,7 @@ ORDER BY (dimension, value);
 """
 
 _RISK_INSERT_SQL = """
-INSERT INTO {risk_table}
+INSERT INTO {risk_table} (dimension, value, uninstall_rate, sample_size)
 SELECT
     '{dim}'      AS dimension,
     {col}        AS value,
@@ -652,18 +655,6 @@ WHERE snapshot_date < toDate('{cutoff}')
 GROUP BY {col}
 HAVING sample_size >= 100
 """
-
-_RISK_UPDATE_SQL = """
-ALTER TABLE {feature_table}
-UPDATE {col}_uninstall_rate = (
-    SELECT uninstall_rate
-    FROM {risk_table} FINAL
-    WHERE dimension = '{col}' AND value = {feature_table}.{col}
-    LIMIT 1
-)
-WHERE snapshot_date >= toDate('{from_date}')
-"""
-
 
 def build_risk_scores(client, cutoff: str, update_from: str):
     client.command(_RISK_BASELINE_DDL.format(risk_table=tables.risk_baseline))
@@ -681,13 +672,28 @@ def build_risk_scores(client, cutoff: str, update_from: str):
         ))
         logger.info(f"[risk] Built baseline for {dim}")
 
+    # ClickHouse mutation không hỗ trợ correlated subquery trong ALTER TABLE UPDATE.
+    # Đọc rates vào Python → sinh CASE WHEN literal thay vì subquery.
+    rates = client.query(
+        f"SELECT dimension, value, uninstall_rate FROM {tables.risk_baseline} FINAL"
+    ).result_rows
+
     for col in ["country", "campaign", "media_source", "app_version"]:
-        client.command(_RISK_UPDATE_SQL.format(
-            risk_table=tables.risk_baseline,
-            feature_table=tables.feature_store,
-            col=col, from_date=update_from,
-        ))
-        logger.info(f"[risk] Updated {col}_uninstall_rate")
+        col_rates = {row[1]: row[2] for row in rates if row[0] == col}
+        if not col_rates:
+            logger.warning(f"[risk] Không có rates cho {col}, bỏ qua")
+            continue
+        cases = " ".join(
+            f"WHEN {col} = '{v.replace(chr(39), chr(39)*2)}' THEN toFloat32({r})"
+            for v, r in col_rates.items()
+        )
+        client.command(
+            f"ALTER TABLE {tables.feature_store} "
+            f"UPDATE {col}_uninstall_rate = CASE {cases} ELSE toFloat32(-1) END "
+            f"WHERE snapshot_date >= toDate('{update_from}')",
+            settings={"mutations_sync": 1},
+        )
+        logger.info(f"[risk] Updated {col}_uninstall_rate ({len(col_rates)} values)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -712,6 +718,16 @@ def build_snapshot(client, snap: str, dry_run: bool = False, force: bool = False
     if existing > 0 and not force and not dry_run:
         logger.info(f"[{snap}] Đã có {existing:,} rows, skip (dùng --force để ghi đè)")
         return
+
+    # Xoá rows cũ trước khi insert mới để tránh rows bị loại bởi HAVING còn tồn đọng
+    # (ReplacingMergeTree chỉ replace rows được re-insert, không xoá rows bị exclude).
+    if existing > 0 and not dry_run:
+        client.command(
+            f"ALTER TABLE {tables.feature_store} "
+            f"DELETE WHERE snapshot_date = toDate('{snap}')",
+            settings={"mutations_sync": 1},
+        )
+        logger.info(f"[{snap}] Deleted {existing:,} old rows")
 
     sql = build_feature_sql(snap)
 

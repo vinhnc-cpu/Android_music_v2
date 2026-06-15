@@ -11,6 +11,7 @@ Cách dùng:
   python -m training.train_model --shap
 """
 import argparse
+import json
 import logging
 import warnings
 from datetime import date, datetime, timedelta
@@ -27,7 +28,7 @@ from sklearn.preprocessing import LabelEncoder
 from configs.settings import (
     tables, ALL_FEATURES, CATEGORICAL_FEATURES,
     LABEL_COL, MODEL_DIR, LABEL_HORIZON,
-    MLFLOW_URI, MLFLOW_EXPERIMENT,
+    MLFLOW_URI, MLFLOW_EXPERIMENT, MODEL_SELECTION_METRIC,
 )
 from features.build_feature_store import get_client
 
@@ -346,6 +347,38 @@ def train_model(model_type: str = "all", run_shap_flag: bool = False):
             segment_analysis(val_df, preds)
         except Exception as e:
             logger.warning(f"[segment] Skipped: {e}")
+
+    # ── Model Selection ───────────────────────────────────────────────────────
+    if len(results) > 1:
+        best = max(results, key=lambda m: results[m]["metrics"][MODEL_SELECTION_METRIC])
+        sel  = {
+            "best_model":         best,
+            "selection_metric":   MODEL_SELECTION_METRIC,
+            "trained_at":         datetime.now().isoformat(),
+            "metrics_comparison": {m: v["metrics"] for m, v in results.items()},
+        }
+        sel_path = MODEL_DIR / "model_selection.json"
+        sel_path.write_text(json.dumps(sel, indent=2))
+
+        metric_cols = ["AUC-ROC", "AUC-PR", "Precision", "Recall", "F1"]
+        metric_keys = ["auc_roc", "auc_pr", "precision", "recall", "f1"]
+        sep = "  " + "-" * (13 + 11 * len(metric_cols))
+        logger.info("\n── Model Selection ──")
+        logger.info("  " + f"{'Model':<13}" + "".join(f"{c:>11}" for c in metric_cols))
+        logger.info(sep)
+        for m, info in sorted(results.items(),
+                               key=lambda x: -x[1]["metrics"][MODEL_SELECTION_METRIC]):
+            mtr  = info["metrics"]
+            mark = "→" if m == best else " "
+            logger.info(
+                f"  {mark} {m:<12}" + "".join(f"{mtr[k]:>11.4f}" for k in metric_keys)
+            )
+        logger.info(sep)
+        logger.info(
+            f"  Best: {best} "
+            f"({MODEL_SELECTION_METRIC}={results[best]['metrics'][MODEL_SELECTION_METRIC]:.4f})"
+        )
+        logger.info(f"  Saved → {sel_path}")
 
     return results
 

@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Model artifacts (mounted as volume at runtime, not baked into image)
+models/
+
+# Logs
+logs/
+
+# Dev / IDE
+.venv/
+venv/
+.env
+*.env
+.idea/
+.vscode/
+*.egg-info/
+
+# Git
+.git/
+.gitignore
+
+# Docs (not needed at runtime)
+docs/
+*.md

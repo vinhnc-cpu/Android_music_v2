@@ -1,0 +1,52 @@
+version: "3.9"
+
+# ML pipeline — dùng để chạy thủ công trên máy dev hoặc server.
+# Airflow đã chạy riêng tại ~/airflow/ trên server, không quản lý ở đây.
+#
+# Lưu ý phiên bản Docker Compose:
+#   Máy dev (Windows/Mac Docker Desktop) : docker compose ...
+#   Server Linux (docker-compose 1.29.2) : docker-compose ...
+
+x-ml: &ml
+  image: android-music-predict:latest
+  build:
+    context: .
+  env_file: .env
+  volumes:
+    - ./models:/app/models
+    - ./logs:/app/logs
+  restart: "no"
+
+services:
+
+  # ── 1. Tạo bảng ClickHouse (chạy 1 lần duy nhất) ────────────────────────────
+  init-tables:
+    <<: *ml
+    command: python -m features.build_feature_store --init_tables
+
+  # ── 2. Build features (nhiều snapshots) ─────────────────────────────────────
+  build-features:
+    <<: *ml
+    command: >
+      python -m features.build_feature_store
+      --date_from 2026-04-14
+      --date_to 2026-06-08
+      --step 7
+
+  # ── 3. Tính risk scores (target encoding) ───────────────────────────────────
+  build-risk:
+    <<: *ml
+    command: >
+      python -m features.build_feature_store
+      --build_risk
+      --risk_cutoff 2026-04-14
+
+  # ── 4. Train models ──────────────────────────────────────────────────────────
+  train:
+    <<: *ml
+    command: python -m training.train_model --model all --shap
+
+  # ── 5. Predict hằng ngày (chạy thủ công khi cần) ────────────────────────────
+  predict:
+    <<: *ml
+    command: python -m prediction.predict
