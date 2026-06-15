@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS {table}
     -- D: Install
     days_since_install              Int32  DEFAULT 0,
     hours_since_install             Int32  DEFAULT 0,
+    minutes_since_install           Int32  DEFAULT 0,
+    seconds_since_install           Int32  DEFAULT 0,
     is_day0_user                    UInt8  DEFAULT 0,
     is_day1_user                    UInt8  DEFAULT 0,
     is_week1_user                   UInt8  DEFAULT 0,
@@ -209,6 +211,12 @@ def create_tables(client):
         button_cols=_button_cols_ddl(),
     )
     client.command(ddl)
+    # Thêm cột mới vào bảng đã tồn tại (idempotent)
+    for col_ddl in [
+        f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS minutes_since_install Int32 DEFAULT 0 AFTER hours_since_install",
+        f"ALTER TABLE {tables.feature_store} ADD COLUMN IF NOT EXISTS seconds_since_install Int32 DEFAULT 0 AFTER minutes_since_install",
+    ]:
+        client.command(col_ddl)
     logger.info(f"Table {tables.feature_store} ready.")
 
     client.command(f"""
@@ -290,17 +298,23 @@ SELECT
     ifNull(argMaxIf(platform, event_timestamp,
         platform IS NOT NULL AND event_date < toDate('{s}')), '')    AS platform,
 
-    -- D: Install
-    -- anyIf thay vì min() để tránh bị ảnh hưởng bởi filter event_date >= snap-30;
-    -- install_date là thuộc tính cố định của user, có mặt trên mọi row.
-    toInt32(dateDiff('day',
-        toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')))       AS days_since_install,
-    toInt32(dateDiff('hour',
-        toDateTime(toDate(anyIf(install_date, isNotNull(install_date)))),
-        toDateTime(toDate('{s}'))))                      AS hours_since_install,
-    toUInt8(toDate(anyIf(install_date, isNotNull(install_date))) = toDate('{s}') - 1) AS is_day0_user,
-    toUInt8(dateDiff('day', toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')) = 1)  AS is_day1_user,
-    toUInt8(dateDiff('day', toDate(anyIf(install_date, isNotNull(install_date))), toDate('{s}')) <= 7) AS is_week1_user,
+    -- D: Install (dùng trực tiếp cột pre-computed từ flat table)
+    -- maxIf(col, event_date < snap): lấy giá trị tại event gần nhất trước snapshot.
+    -- D0 user (install_date = snap) không có event trước snap → ifNull → 0.
+    toInt32(ifNull(maxIf(src.days_since_install,
+        event_date < toDate('{s}') AND src.days_since_install IS NOT NULL), 0))    AS days_since_install,
+    toInt32(ifNull(maxIf(src.hours_since_install,
+        event_date < toDate('{s}') AND src.hours_since_install IS NOT NULL), 0))   AS hours_since_install,
+    toInt32(ifNull(maxIf(src.minutes_since_install,
+        event_date < toDate('{s}') AND src.minutes_since_install IS NOT NULL), 0)) AS minutes_since_install,
+    toInt32(ifNull(maxIf(src.seconds_since_install,
+        event_date < toDate('{s}') AND src.seconds_since_install IS NOT NULL), 0)) AS seconds_since_install,
+    toUInt8(ifNull(maxIf(src.days_since_install,
+        event_date < toDate('{s}') AND src.days_since_install IS NOT NULL), 0) = 0)  AS is_day0_user,
+    toUInt8(ifNull(maxIf(src.days_since_install,
+        event_date < toDate('{s}') AND src.days_since_install IS NOT NULL), 0) = 1)  AS is_day1_user,
+    toUInt8(ifNull(maxIf(src.days_since_install,
+        event_date < toDate('{s}') AND src.days_since_install IS NOT NULL), 0) <= 7) AS is_week1_user,
 
     -- E: Session
     toUInt32(countDistinctIf(unique_session_id,

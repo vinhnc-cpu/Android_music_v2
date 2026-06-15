@@ -99,6 +99,7 @@ CATEGORICAL_FEATURES: List[str] = [
 NUMERICAL_FEATURES: List[str] = [
     # D: Install
     "days_since_install", "hours_since_install",
+    "minutes_since_install", "seconds_since_install",
     "is_day0_user", "is_day1_user", "is_week1_user",
     # E: Session
     "session_cnt_1d", "session_cnt_3d", "session_cnt_7d",

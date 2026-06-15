@@ -38,11 +38,11 @@ def _build_features_4w(**context) -> None:
     snap_to   = (context["dag_run"].conf or {}).get("snapshot_date") or context["ds"]
     snap_from = (date.fromisoformat(snap_to) - timedelta(days=28)).isoformat()
 
-    # Tạo danh sách snapshots weekly
+    # Daily snapshots để không bỏ sót user cài giữa 2 snapshot weekly
     d, end, snaps = date.fromisoformat(snap_from), date.fromisoformat(snap_to), []
     while d <= end:
         snaps.append(d.isoformat())
-        d += timedelta(days=7)
+        d += timedelta(days=1)
 
     logger.info(f"[dag] build_features_4w: {snap_from} → {snap_to} ({len(snaps)} snaps)")
     client = get_client()

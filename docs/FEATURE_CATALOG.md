@@ -8,12 +8,14 @@
 | **Feature store** | `android_music_v2.feature_store_uninstall` |
 | **Dạng bảng** | `ReplacingMergeTree(created_at)` — INSERT mới với `created_at` cao hơn sẽ thay thế hàng cũ |
 | **Đơn vị hàng** | `(snapshot_date, user_pseudo_id)` — mỗi cặp = 1 hàng |
+| **Snapshot granularity** | **Daily (step=1)** — mỗi ngày 1 snapshot, tránh bỏ sót user cài+xóa trong cùng khoảng giữa 2 snapshot tuần |
 | **Feature window** | `[snapshot_date - 30, snapshot_date)` — không dùng dữ liệu tương lai |
 | **Label window** | `[snapshot_date, snapshot_date + 7)` |
 | **Label** | `label_uninstall_7d = 1` nếu có event `app_remove` trong 7 ngày sau snapshot |
 | **Label rate** | ~4–10% (tùy snapshot, D0-D30 cohort) |
 | **User filter** | `install_date ∈ [snapshot_date - 30, snapshot_date]` — chỉ dự đoán user D0–D30 |
 | **Leakage rule** | Mọi feature dùng `event_date < snapshot_date`; label dùng `event_date >= snapshot_date` |
+| **Training dedup** | Mỗi user có thể xuất hiện nhiều snapshot — training lấy snapshot có `days_since_install` cao nhất (gần churn nhất) |
 
 ### WHERE clause trong SQL
 
@@ -91,22 +93,28 @@ HAVING toDate(anyIf(install_date, isNotNull(install_date)))
 
 ---
 
-## Section D — Install (5 features)
+## Section D — Install (7 features)
 
-**Nguồn cột**: `install_date` (DateTime, user-level property, có trên mọi row)
+**Nguồn cột**: `days_since_install`, `hours_since_install`, `minutes_since_install`, `seconds_since_install`
+— 4 cột pre-computed sẵn trong flat table (Int32), không tính lại từ `install_date`.
 
-Ký hiệu: `idate = toDate(anyIf(install_date, isNotNull(install_date)))`
-— dùng `anyIf` thay `min()` để tránh bị ảnh hưởng bởi filter `event_date >= snap-30`.
+**Công thức chung**: `toInt32(ifNull(maxIf(src.<col>, event_date < snap AND src.<col> IS NOT NULL), 0))`
+— `maxIf` lấy giá trị tại event **gần nhất trước snapshot**. D0 user (cài đúng ngày snap, không có event trước snap) → `ifNull` trả về `0`.
 
-| Feature | Công thức SQL | Giải thích |
+`install_date` vẫn dùng trong HAVING để filter chính xác D0–D30 cohort.
+
+| Feature | Cột nguồn | Giải thích |
 |---|---|---|
-| `days_since_install` | `toInt32(dateDiff('day', idate, toDate(snap)))` | Số ngày từ cài → snapshot. D0=0, D1=1, ... |
-| `hours_since_install` | `toInt32(dateDiff('hour', toDateTime(idate), toDateTime(toDate(snap))))` | Cùng ý nghĩa nhưng đơn vị giờ |
-| `is_day0_user` | `toUInt8(idate = toDate(snap) - 1)` | **Lưu ý**: flag = 1 khi `install_date = snap - 1`, tức `days_since_install = 1` — đặt tên "D0" nhưng thực chất là D1 user |
-| `is_day1_user` | `toUInt8(dateDiff('day', idate, toDate(snap)) = 1)` | = 1 khi `days_since_install = 1` — **trùng với `is_day0_user`** |
-| `is_week1_user` | `toUInt8(dateDiff('day', idate, toDate(snap)) <= 7)` | = 1 khi user cài trong 7 ngày qua |
+| `days_since_install` | `src.days_since_install` | Số ngày từ cài → snapshot. D0=0, D1=1, ... |
+| `hours_since_install` | `src.hours_since_install` | Tổng số giờ từ cài → snapshot |
+| `minutes_since_install` | `src.minutes_since_install` | Tổng số phút từ cài → snapshot |
+| `seconds_since_install` | `src.seconds_since_install` | Tổng số giây từ cài → snapshot |
+| `is_day0_user` | `src.days_since_install` | `days_since_install = 0` — cài đúng ngày snapshot |
+| `is_day1_user` | `src.days_since_install` | `days_since_install = 1` |
+| `is_week1_user` | `src.days_since_install` | `days_since_install <= 7` |
 
-> `is_day0_user` và `is_day1_user` tính cùng một điều kiện (`days_since_install = 1`). User cài đúng ngày snapshot (`days_since_install = 0`) không được flag riêng — nhưng vẫn có trong feature store và được model nhận biết qua `days_since_install = 0`.
+> D0 user (install_date = snap): không có event trước snap → `maxIf` = NULL → `ifNull` → 0 → `is_day0_user = 1`. Đúng.
+> `is_day0_user` đã được sửa: trước đây check `install_date = snap - 1` (là D1, sai). Nay check `days_since_install = 0` (D0 thực sự).
 
 ---
 
@@ -456,7 +464,7 @@ Rate giảm theo thời gian vì snapshot đầu (14/04) gần ngày app ra mắ
 | A | Acquisition | 3 |
 | B | Country / Language | 2 |
 | C | Device | 2 |
-| D | Install | 5 |
+| D | Install | 7 |
 | E | Session | 9 |
 | F | Engagement | 6 |
 | G | Recency | 6 |
@@ -472,7 +480,7 @@ Rate giảm theo thời gian vì snapshot đầu (14/04) gần ngày app ra mắ
 | Q | Journey | 9 |
 | R | Funnel | 8 |
 | T | Risk Scores | 4 |
-| **TOTAL** | | **157 numerical + 10 categorical = 167** |
+| **TOTAL** | | **159 numerical + 10 categorical = 169** |
 
 ### 10 Categorical features (cần encoding):
 `media_source`, `campaign`, `country`, `language`, `app_version`,
