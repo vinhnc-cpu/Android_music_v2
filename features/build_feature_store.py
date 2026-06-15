@@ -1,0 +1,779 @@
+"""
+Build Feature Store cho Android Music v2 Uninstall Prediction.
+
+Mỗi (snapshot_date, user_pseudo_id) = 1 hàng features + label.
+- Feature window : [snapshot_date - 30, snapshot_date)  -- không dùng dữ liệu tương lai
+- Label window   : [snapshot_date,      snapshot_date + 7)  -- app_remove xảy ra không?
+
+Cách dùng:
+  python -m features.build_feature_store --snapshot_date 2026-06-08
+  python -m features.build_feature_store --date_from 2026-04-14 --date_to 2026-06-08 --step 7
+  python -m features.build_feature_store --init_tables
+  python -m features.build_feature_store --build_risk --risk_cutoff 2026-04-14
+"""
+import argparse
+import logging
+from datetime import date, timedelta
+from typing import List
+
+import clickhouse_connect
+
+from configs.settings import (
+    ch, tables, TOP_SCREENS, TOP_BUTTONS,
+    LABEL_HORIZON, FEATURE_WINDOW,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def get_client() -> clickhouse_connect.driver.Client:
+    return clickhouse_connect.get_client(
+        host=ch.host, port=ch.port,
+        username=ch.username, password=ch.password,
+        database=ch.database,
+        send_receive_timeout=ch.send_receive_timeout,
+        connect_timeout=ch.connect_timeout,
+        settings={"max_memory_usage": 32_000_000_000},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _screen_cols_ddl() -> str:
+    lines = []
+    for s in TOP_SCREENS:
+        col = s.replace("-", "_").replace(" ", "_")
+        lines.append(f"    screen_{col}_cnt_7d           UInt32 DEFAULT 0,")
+    return "\n".join(lines)
+
+
+def _button_cols_ddl() -> str:
+    lines = []
+    for b in TOP_BUTTONS:
+        lines.append(f"    btn_{b}_cnt_7d                UInt32 DEFAULT 0,")
+    return "\n".join(lines)
+
+
+_DDL_FEATURE_STORE = """
+CREATE TABLE IF NOT EXISTS {table}
+(
+    snapshot_date                   Date,
+    user_pseudo_id                  String,
+
+    -- A: Acquisition
+    media_source                    String DEFAULT '',
+    campaign                        String DEFAULT '',
+    has_attribution                 UInt8  DEFAULT 0,
+
+    -- B: Country / Language
+    country                         String DEFAULT '',
+    language                        String DEFAULT '',
+
+    -- C: Device
+    app_version                     String DEFAULT '',
+    platform                        String DEFAULT '',
+
+    -- D: Install
+    days_since_install              Int32  DEFAULT 0,
+    hours_since_install             Int32  DEFAULT 0,
+    is_day0_user                    UInt8  DEFAULT 0,
+    is_day1_user                    UInt8  DEFAULT 0,
+    is_week1_user                   UInt8  DEFAULT 0,
+
+    -- E: Session
+    session_cnt_1d                  UInt32 DEFAULT 0,
+    session_cnt_3d                  UInt32 DEFAULT 0,
+    session_cnt_7d                  UInt32 DEFAULT 0,
+    session_cnt_14d                 UInt32 DEFAULT 0,
+    session_cnt_30d                 UInt32 DEFAULT 0,
+    active_days_7d                  UInt32 DEFAULT 0,
+    active_days_30d                 UInt32 DEFAULT 0,
+    avg_sessions_per_day_7d         Float32 DEFAULT 0,
+    session_trend_7d                Float32 DEFAULT 1,
+
+    -- F: Engagement
+    engagement_time_ms_1d           Int64  DEFAULT 0,
+    engagement_time_ms_3d           Int64  DEFAULT 0,
+    engagement_time_ms_7d           Int64  DEFAULT 0,
+    engagement_time_ms_30d          Int64  DEFAULT 0,
+    avg_engagement_per_session_7d   Float32 DEFAULT 0,
+    engagement_trend_7d             Float32 DEFAULT 1,
+
+    -- G: Recency (giờ kể từ lần cuối, 9999 = chưa bao giờ)
+    hours_since_last_session        UInt32 DEFAULT 9999,
+    hours_since_last_screen         UInt32 DEFAULT 9999,
+    hours_since_last_click          UInt32 DEFAULT 9999,
+    hours_since_last_ad             UInt32 DEFAULT 9999,
+    hours_since_last_search         UInt32 DEFAULT 9999,
+    hours_since_last_engagement     UInt32 DEFAULT 9999,
+
+    -- H: Screens (7d)
+{screen_cols}
+    unique_screen_cnt_7d            UInt32 DEFAULT 0,
+    home_ratio_7d                   Float32 DEFAULT 0,
+    video_ratio_7d                  Float32 DEFAULT 0,
+    lyrics_ratio_7d                 Float32 DEFAULT 0,
+    permission_screen_ratio_7d      Float32 DEFAULT 0,
+
+    -- I: Buttons (7d)
+{button_cols}
+    unique_button_cnt_7d            UInt32 DEFAULT 0,
+
+    -- J: Search
+    search_online_cnt_7d            UInt32 DEFAULT 0,
+    search_quick_cnt_7d             UInt32 DEFAULT 0,
+    search_screen_cnt_7d            UInt32 DEFAULT 0,
+    used_search_7d                  UInt8  DEFAULT 0,
+    search_days_7d                  UInt32 DEFAULT 0,
+
+    -- K: Audio
+    lyrics_screen_cnt_7d            UInt32 DEFAULT 0,
+    audio_player_cnt_7d             UInt32 DEFAULT 0,
+    playlist_cnt_7d                 UInt32 DEFAULT 0,
+    queue_cnt_7d                    UInt32 DEFAULT 0,
+    audio_screen_ratio_7d           Float32 DEFAULT 0,
+
+    -- L: Video
+    video_player_cnt_7d             UInt32 DEFAULT 0,
+    video_tab_cnt_7d                UInt32 DEFAULT 0,
+    floating_video_cnt_7d           UInt32 DEFAULT 0,
+
+    -- M: Permission
+    seen_notification_permission    UInt8  DEFAULT 0,
+    seen_any_permission             UInt8  DEFAULT 0,
+    permission_screen_cnt_7d        UInt32 DEFAULT 0,
+    notif_permission_status         String DEFAULT '',
+
+    -- N: Ads
+    load_ad_cnt_7d                  UInt32 DEFAULT 0,
+    show_ad_cnt_7d                  UInt32 DEFAULT 0,
+    paid_ad_impression_cnt_7d       UInt32 DEFAULT 0,
+    ads_per_session_7d              Float32 DEFAULT 0,
+    ad_revenue_7d                   Float32 DEFAULT 0,
+
+    -- O: IAP / Subscription
+    iap_cnt_30d                     UInt32 DEFAULT 0,
+    payer_flag                      UInt8  DEFAULT 0,
+
+    -- P: App Quality
+    app_exception_cnt_7d            UInt32 DEFAULT 0,
+    app_clear_data_cnt_30d          UInt32 DEFAULT 0,
+    app_update_cnt_30d              UInt32 DEFAULT 0,
+    app_exit_cnt_7d                 UInt32 DEFAULT 0,
+
+    -- Q: Journey
+    first_screen                    String DEFAULT '',
+    last_screen                     String DEFAULT '',
+    first_button                    String DEFAULT '',
+    last_button                     String DEFAULT '',
+    home_to_search_flag             UInt8  DEFAULT 0,
+    search_to_lyrics_flag           UInt8  DEFAULT 0,
+    search_to_video_flag            UInt8  DEFAULT 0,
+    lyrics_to_exit_flag             UInt8  DEFAULT 0,
+    permission_to_exit_flag         UInt8  DEFAULT 0,
+
+    -- R: Funnel
+    visited_home                    UInt8  DEFAULT 0,
+    visited_player                  UInt8  DEFAULT 0,
+    visited_lyrics                  UInt8  DEFAULT 0,
+    visited_search                  UInt8  DEFAULT 0,
+    visited_video                   UInt8  DEFAULT 0,
+    visited_playlist                UInt8  DEFAULT 0,
+    visited_scan_music              UInt8  DEFAULT 0,
+    funnel_depth                    UInt8  DEFAULT 0,
+
+    -- T: Risk scores (target encoding — điền sau)
+    country_uninstall_rate          Float32 DEFAULT -1,
+    campaign_uninstall_rate         Float32 DEFAULT -1,
+    media_source_uninstall_rate     Float32 DEFAULT -1,
+    app_version_uninstall_rate      Float32 DEFAULT -1,
+
+    -- Label
+    label_uninstall_7d              UInt8  DEFAULT 0,
+
+    created_at                      DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(created_at)
+PARTITION BY toYYYYMM(snapshot_date)
+ORDER BY (snapshot_date, user_pseudo_id)
+SETTINGS index_granularity = 8192;
+"""
+
+
+def create_tables(client):
+    ddl = _DDL_FEATURE_STORE.format(
+        table=tables.feature_store,
+        screen_cols=_screen_cols_ddl(),
+        button_cols=_button_cols_ddl(),
+    )
+    client.command(ddl)
+    logger.info(f"Table {tables.feature_store} ready.")
+
+    client.command(f"""
+    CREATE TABLE IF NOT EXISTS {tables.training}
+    AS {tables.feature_store}
+    ENGINE = ReplacingMergeTree(created_at)
+    PARTITION BY toYYYYMM(snapshot_date)
+    ORDER BY (snapshot_date, user_pseudo_id)
+    """)
+    logger.info(f"Table {tables.training} ready.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature SQL builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _screen_sql_cols(snap: str) -> str:
+    lines = []
+    for s in TOP_SCREENS:
+        col = s.replace("-", "_").replace(" ", "_")
+        lines.append(
+            f"    countIf(mapped_screen = '{s}'"
+            f" AND event_date >= toDate('{snap}') - 7"
+            f" AND event_date < toDate('{snap}'))       AS screen_{col}_cnt_7d,"
+        )
+    return "\n".join(lines)
+
+
+def _button_sql_cols(snap: str) -> str:
+    lines = []
+    for b in TOP_BUTTONS:
+        lines.append(
+            f"    countIf(click_button_name = '{b}'"
+            f" AND event_date >= toDate('{snap}') - 7"
+            f" AND event_date < toDate('{snap}'))          AS btn_{b}_cnt_7d,"
+        )
+    return "\n".join(lines)
+
+
+def build_feature_sql(snap: str) -> str:
+    """Trả về INSERT SQL cho snapshot_date snap.
+
+    Quét dữ liệu [snap-30, snap+7) trong 1 pass.
+    Feature cols: điều kiện event_date < snap (không leak tương lai).
+    Label col   : điều kiện event_date IN [snap, snap+7).
+    """
+    s            = snap
+    source_table = tables.source
+    screen_sql   = _screen_sql_cols(s)
+    button_sql   = _button_sql_cols(s)
+
+    return f"""
+INSERT INTO {tables.feature_store}
+SELECT
+    toDate('{s}')          AS snapshot_date,
+    src.user_pseudo_id,
+
+    -- A: Acquisition
+    ifNull(argMaxIf(up_af_media_source, event_timestamp,
+        up_af_media_source != '' AND up_af_media_source IS NOT NULL
+        AND event_date < toDate('{s}')), '')           AS media_source,
+    ifNull(argMaxIf(up_af_campaign, event_timestamp,
+        up_af_campaign != '' AND up_af_campaign IS NOT NULL
+        AND event_date < toDate('{s}')), '')            AS campaign,
+    toUInt8(countIf(event_name = 'af_attribution_received'
+        AND event_date < toDate('{s}')) > 0)            AS has_attribution,
+
+    -- B: Country / Language
+    ifNull(argMaxIf(country, event_timestamp,
+        country != '' AND country IS NOT NULL
+        AND event_date < toDate('{s}')), '')             AS country,
+    ifNull(argMaxIf(up_language, event_timestamp,
+        up_language != '' AND up_language IS NOT NULL
+        AND event_date < toDate('{s}')), '')             AS language,
+
+    -- C: Device
+    ifNull(argMaxIf(app_version, event_timestamp,
+        app_version IS NOT NULL AND event_date < toDate('{s}')), '') AS app_version,
+    ifNull(argMaxIf(platform, event_timestamp,
+        platform IS NOT NULL AND event_date < toDate('{s}')), '')    AS platform,
+
+    -- D: Install
+    toInt32(dateDiff('day',
+        toDate(min(install_date)), toDate('{s}')))       AS days_since_install,
+    toInt32(dateDiff('hour',
+        toDateTime(toDate(min(install_date))),
+        toDateTime(toDate('{s}'))))                      AS hours_since_install,
+    toUInt8(toDate(min(install_date)) = toDate('{s}') - 1) AS is_day0_user,
+    toUInt8(dateDiff('day', toDate(min(install_date)), toDate('{s}')) = 1)  AS is_day1_user,
+    toUInt8(dateDiff('day', toDate(min(install_date)), toDate('{s}')) <= 7) AS is_week1_user,
+
+    -- E: Session
+    toUInt32(countDistinctIf(unique_session_id,
+        event_name = 'session_start'
+        AND event_date = toDate('{s}') - 1))             AS session_cnt_1d,
+    toUInt32(countDistinctIf(unique_session_id,
+        event_name = 'session_start'
+        AND event_date >= toDate('{s}') - 3
+        AND event_date < toDate('{s}')))                 AS session_cnt_3d,
+    toUInt32(countDistinctIf(unique_session_id,
+        event_name = 'session_start'
+        AND event_date >= toDate('{s}') - 7
+        AND event_date < toDate('{s}')))                 AS session_cnt_7d,
+    toUInt32(countDistinctIf(unique_session_id,
+        event_name = 'session_start'
+        AND event_date >= toDate('{s}') - 14
+        AND event_date < toDate('{s}')))                 AS session_cnt_14d,
+    toUInt32(countDistinctIf(unique_session_id,
+        event_name = 'session_start'
+        AND event_date >= toDate('{s}') - 30
+        AND event_date < toDate('{s}')))                 AS session_cnt_30d,
+
+    toUInt32(countDistinctIf(event_date,
+        event_date >= toDate('{s}') - 7
+        AND event_date < toDate('{s}')))                 AS active_days_7d,
+    toUInt32(countDistinctIf(event_date,
+        event_date >= toDate('{s}') - 30
+        AND event_date < toDate('{s}')))                 AS active_days_30d,
+
+    if(countDistinctIf(event_date,
+            event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) /
+       countDistinctIf(event_date,
+            event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')),
+       0.0)                                              AS avg_sessions_per_day_7d,
+
+    if(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 14 AND event_date < toDate('{s}') - 7) > 0,
+       toFloat32(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 14 AND event_date < toDate('{s}') - 7)),
+       if(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+          2.0, 1.0))                                     AS session_trend_7d,
+
+    -- F: Engagement (milliseconds)
+    toInt64(sumIf(ifNull(engagement_time, 0),
+        event_date = toDate('{s}') - 1))                 AS engagement_time_ms_1d,
+    toInt64(sumIf(ifNull(engagement_time, 0),
+        event_date >= toDate('{s}') - 3 AND event_date < toDate('{s}')))  AS engagement_time_ms_3d,
+    toInt64(sumIf(ifNull(engagement_time, 0),
+        event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS engagement_time_ms_7d,
+    toInt64(sumIf(ifNull(engagement_time, 0),
+        event_date >= toDate('{s}') - 30 AND event_date < toDate('{s}'))) AS engagement_time_ms_30d,
+
+    if(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(sumIf(ifNull(engagement_time, 0),
+            event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS avg_engagement_per_session_7d,
+
+    if(sumIf(ifNull(engagement_time, 0),
+            event_date >= toDate('{s}') - 14 AND event_date < toDate('{s}') - 7) > 0,
+       toFloat32(sumIf(ifNull(engagement_time, 0),
+            event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(sumIf(ifNull(engagement_time, 0),
+            event_date >= toDate('{s}') - 14 AND event_date < toDate('{s}') - 7)),
+       if(sumIf(ifNull(engagement_time, 0),
+            event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+          2.0, 1.0))                                     AS engagement_trend_7d,
+
+    -- G: Recency
+    toUInt32(if(max(if(event_date < toDate('{s}'), event_date, toDate('1970-01-01'))) > toDate('1970-01-01'),
+        dateDiff('day',
+            max(if(event_date < toDate('{s}'), event_date, toDate('1970-01-01'))),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_session,
+
+    toUInt32(if(maxIf(event_date, event_name IN ('screen_view', 'screen_view_ev')
+            AND event_date < toDate('{s}')) > toDate('1970-01-01'),
+        dateDiff('day',
+            maxIf(event_date, event_name IN ('screen_view', 'screen_view_ev')
+                AND event_date < toDate('{s}')),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_screen,
+
+    toUInt32(if(maxIf(event_date, event_name = 'click_btn_ev'
+            AND event_date < toDate('{s}')) > toDate('1970-01-01'),
+        dateDiff('day',
+            maxIf(event_date, event_name = 'click_btn_ev'
+                AND event_date < toDate('{s}')),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_click,
+
+    toUInt32(if(maxIf(event_date, event_name IN ('show_ad_ev', 'load_ad_ev', 'paid_ad_impression')
+            AND event_date < toDate('{s}')) > toDate('1970-01-01'),
+        dateDiff('day',
+            maxIf(event_date, event_name IN ('show_ad_ev', 'load_ad_ev', 'paid_ad_impression')
+                AND event_date < toDate('{s}')),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_ad,
+
+    toUInt32(if(maxIf(event_date, click_button_name IN ('Search', 'QuickSearchClicked')
+            AND event_date < toDate('{s}')) > toDate('1970-01-01'),
+        dateDiff('day',
+            maxIf(event_date, click_button_name IN ('Search', 'QuickSearchClicked')
+                AND event_date < toDate('{s}')),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_search,
+
+    toUInt32(if(maxIf(event_date, event_name = 'user_engagement'
+            AND event_date < toDate('{s}')) > toDate('1970-01-01'),
+        dateDiff('day',
+            maxIf(event_date, event_name = 'user_engagement'
+                AND event_date < toDate('{s}')),
+            toDate('{s}')) * 24,
+        9999))                                           AS hours_since_last_engagement,
+
+    -- H: Screens (7d)
+{screen_sql}
+    toUInt32(countDistinctIf(mapped_screen,
+        event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')
+        AND mapped_screen IS NOT NULL AND mapped_screen != ''))  AS unique_screen_cnt_7d,
+
+    if(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(mapped_screen = 'MainAudioHome'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS home_ratio_7d,
+
+    if(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(mapped_screen IN (
+            'VideoPlayer', 'MainVideoTabLocal', 'FloatingVideo', 'VideoSelection')
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS video_ratio_7d,
+
+    if(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(mapped_screen = 'AudioPlayerLyrics'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS lyrics_ratio_7d,
+
+    if(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(mapped_screen LIKE '%Permission%'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countIf(mapped_screen IS NOT NULL AND mapped_screen != ''
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS permission_screen_ratio_7d,
+
+    -- I: Buttons (7d)
+{button_sql}
+    toUInt32(countDistinctIf(click_button_name,
+        event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')
+        AND click_button_name IS NOT NULL AND click_button_name != ''))  AS unique_button_cnt_7d,
+
+    -- J: Search
+    toUInt32(countIf(click_button_name = 'Search'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS search_online_cnt_7d,
+    toUInt32(countIf(click_button_name = 'QuickSearchClicked'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS search_quick_cnt_7d,
+    toUInt32(countIf(mapped_screen = 'AudioSearchAll'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS search_screen_cnt_7d,
+    toUInt8(countIf(click_button_name IN ('Search', 'QuickSearchClicked')
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0) AS used_search_7d,
+    toUInt32(countDistinctIf(event_date,
+        click_button_name IN ('Search', 'QuickSearchClicked')
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS search_days_7d,
+
+    -- K: Audio
+    toUInt32(countIf(mapped_screen = 'AudioPlayerLyrics'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS lyrics_screen_cnt_7d,
+    toUInt32(countIf(mapped_screen = 'AudioPlayerSong'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS audio_player_cnt_7d,
+    toUInt32(countIf(mapped_screen IN ('AudioPlaylistsDetail', 'MainAudioTabPlaylists')
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS playlist_cnt_7d,
+    toUInt32(countIf(mapped_screen = 'AudioPlayerQueue'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS queue_cnt_7d,
+    if(countIf(event_name IN ('screen_view', 'screen_view_ev')
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(mapped_screen IN ('AudioPlayerSong', 'AudioPlayerLyrics', 'AudioPlayerQueue')
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countIf(event_name IN ('screen_view', 'screen_view_ev')
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS audio_screen_ratio_7d,
+
+    -- L: Video
+    toUInt32(countIf(mapped_screen = 'VideoPlayer'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS video_player_cnt_7d,
+    toUInt32(countIf(mapped_screen = 'MainVideoTabLocal'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS video_tab_cnt_7d,
+    toUInt32(countIf(mapped_screen = 'FloatingVideo'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS floating_video_cnt_7d,
+
+    -- M: Permission
+    toUInt8(countIf(mapped_screen = 'MainAudio_RequestNotificationPermission') > 0) AS seen_notification_permission,
+    toUInt8(countIf(mapped_screen LIKE '%Permission%') > 0)  AS seen_any_permission,
+    toUInt32(countIf(mapped_screen LIKE '%Permission%'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS permission_screen_cnt_7d,
+    ifNull(argMaxIf(up_allow_notification, event_timestamp,
+        event_date < toDate('{s}')), '')                 AS notif_permission_status,
+
+    -- N: Ads
+    toUInt32(countIf(event_name = 'load_ad_ev'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS load_ad_cnt_7d,
+    toUInt32(countIf(event_name = 'show_ad_ev'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS show_ad_cnt_7d,
+    toUInt32(countIf(event_name = 'paid_ad_impression'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS paid_ad_impression_cnt_7d,
+    if(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')) > 0,
+       toFloat32(countIf(event_name = 'show_ad_ev'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))) /
+       toFloat32(countDistinctIf(unique_session_id,
+            event_name = 'session_start'
+            AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}'))),
+       0.0)                                              AS ads_per_session_7d,
+    toFloat32(sumIf(ifNull(ep_revenue, 0),
+        event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))      AS ad_revenue_7d,
+
+    -- O: IAP / Subscription
+    toUInt32(countIf(event_name = 'iap_ev'
+        AND event_date >= toDate('{s}') - 30 AND event_date < toDate('{s}'))) AS iap_cnt_30d,
+    toUInt8(countIf(event_name = 'iap_ev'
+        AND event_date < toDate('{s}')) > 0)             AS payer_flag,
+
+    -- P: Quality
+    toUInt32(countIf(event_name = 'app_exception'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS app_exception_cnt_7d,
+    toUInt32(countIf(event_name = 'app_clear_data'
+        AND event_date >= toDate('{s}') - 30 AND event_date < toDate('{s}'))) AS app_clear_data_cnt_30d,
+    toUInt32(countIf(event_name = 'app_update'
+        AND event_date >= toDate('{s}') - 30 AND event_date < toDate('{s}'))) AS app_update_cnt_30d,
+    toUInt32(countIf(event_name = 'app_exit'
+        AND event_date >= toDate('{s}') - 7 AND event_date < toDate('{s}')))  AS app_exit_cnt_7d,
+
+    -- Q: Journey
+    ifNull(argMinIf(mapped_screen, event_timestamp,
+        mapped_screen IS NOT NULL AND mapped_screen != ''
+        AND event_date < toDate('{s}')), '')             AS first_screen,
+    ifNull(argMaxIf(mapped_screen, event_timestamp,
+        mapped_screen IS NOT NULL AND mapped_screen != ''
+        AND event_date < toDate('{s}')), '')             AS last_screen,
+    ifNull(argMinIf(click_button_name, event_timestamp,
+        click_button_name IS NOT NULL AND click_button_name != ''
+        AND event_date < toDate('{s}')), '')             AS first_button,
+    ifNull(argMaxIf(click_button_name, event_timestamp,
+        click_button_name IS NOT NULL AND click_button_name != ''
+        AND event_date < toDate('{s}')), '')             AS last_button,
+
+    toUInt8(countIf(mapped_screen = 'MainAudioHome' AND event_date < toDate('{s}')) > 0
+        AND countIf(mapped_screen = 'AudioSearchAll' AND event_date < toDate('{s}')) > 0) AS home_to_search_flag,
+    toUInt8(countIf(mapped_screen = 'AudioSearchAll' AND event_date < toDate('{s}')) > 0
+        AND countIf(mapped_screen = 'AudioPlayerLyrics' AND event_date < toDate('{s}')) > 0) AS search_to_lyrics_flag,
+    toUInt8(countIf(mapped_screen = 'AudioSearchAll' AND event_date < toDate('{s}')) > 0
+        AND countIf(mapped_screen = 'VideoPlayer' AND event_date < toDate('{s}')) > 0) AS search_to_video_flag,
+    toUInt8(countIf(mapped_screen = 'AudioPlayerLyrics' AND event_date < toDate('{s}')) > 0
+        AND countIf(event_name = 'app_exit' AND event_date < toDate('{s}')) > 0) AS lyrics_to_exit_flag,
+    toUInt8(countIf(mapped_screen LIKE '%Permission%' AND event_date < toDate('{s}')) > 0
+        AND countIf(event_name = 'app_exit' AND event_date < toDate('{s}')) > 0) AS permission_to_exit_flag,
+
+    -- R: Funnel
+    toUInt8(countIf(mapped_screen = 'MainAudioHome' AND event_date < toDate('{s}')) > 0)   AS visited_home,
+    toUInt8(countIf(mapped_screen IN ('AudioPlayerSong', 'AudioPlayerLyrics', 'VideoPlayer')
+        AND event_date < toDate('{s}')) > 0)             AS visited_player,
+    toUInt8(countIf(mapped_screen = 'AudioPlayerLyrics' AND event_date < toDate('{s}')) > 0) AS visited_lyrics,
+    toUInt8(countIf(mapped_screen = 'AudioSearchAll' AND event_date < toDate('{s}')) > 0)  AS visited_search,
+    toUInt8(countIf(mapped_screen IN ('VideoPlayer', 'MainVideoTabLocal')
+        AND event_date < toDate('{s}')) > 0)             AS visited_video,
+    toUInt8(countIf(mapped_screen IN ('AudioPlaylistsDetail', 'MainAudioTabPlaylists')
+        AND event_date < toDate('{s}')) > 0)             AS visited_playlist,
+    toUInt8(countIf(mapped_screen = 'ScanMusic' AND event_date < toDate('{s}')) > 0)       AS visited_scan_music,
+
+    toUInt8(
+        toUInt8(countIf(mapped_screen = 'MainAudioHome' AND event_date < toDate('{s}')) > 0) +
+        toUInt8(countIf(mapped_screen IN ('AudioPlayerSong', 'VideoPlayer')
+            AND event_date < toDate('{s}')) > 0) +
+        toUInt8(countIf(mapped_screen = 'AudioPlayerLyrics' AND event_date < toDate('{s}')) > 0) +
+        toUInt8(countIf(mapped_screen = 'AudioSearchAll' AND event_date < toDate('{s}')) > 0) +
+        toUInt8(countIf(mapped_screen IN ('AudioPlaylistsDetail', 'MainAudioTabPlaylists')
+            AND event_date < toDate('{s}')) > 0)
+    )                                                    AS funnel_depth,
+
+    -- T: Risk scores — mặc định -1, điền sau bằng build_risk_scores()
+    toFloat32(-1)   AS country_uninstall_rate,
+    toFloat32(-1)   AS campaign_uninstall_rate,
+    toFloat32(-1)   AS media_source_uninstall_rate,
+    toFloat32(-1)   AS app_version_uninstall_rate,
+
+    -- Label: app_remove trong [snapshot, snapshot + 7d)
+    toUInt8(countIf(event_name = 'app_remove'
+        AND event_date >= toDate('{s}')
+        AND event_date < toDate('{s}') + {LABEL_HORIZON}) > 0) AS label_uninstall_7d,
+
+    now()           AS created_at
+
+FROM {source_table} src
+WHERE src.event_date >= toDate('{s}') - {FEATURE_WINDOW}
+  AND src.event_date < toDate('{s}') + {LABEL_HORIZON}
+GROUP BY src.user_pseudo_id
+HAVING countIf(event_date < toDate('{s}')) > 0
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Target Encoding (Section T)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RISK_BASELINE_DDL = """
+CREATE TABLE IF NOT EXISTS {risk_table}
+(
+    dimension      String,
+    value          String,
+    uninstall_rate Float32,
+    sample_size    UInt32,
+    updated_at     DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (dimension, value);
+"""
+
+_RISK_INSERT_SQL = """
+INSERT INTO {risk_table}
+SELECT
+    '{dim}'      AS dimension,
+    {col}        AS value,
+    round(avg(label_uninstall_7d), 4) AS uninstall_rate,
+    count()      AS sample_size
+FROM {feature_table} FINAL
+WHERE snapshot_date < toDate('{cutoff}')
+  AND {col} != '' AND {col} IS NOT NULL
+GROUP BY {col}
+HAVING sample_size >= 100
+"""
+
+_RISK_UPDATE_SQL = """
+ALTER TABLE {feature_table}
+UPDATE {col}_uninstall_rate = (
+    SELECT uninstall_rate
+    FROM {risk_table} FINAL
+    WHERE dimension = '{col}' AND value = {feature_table}.{col}
+    LIMIT 1
+)
+WHERE snapshot_date >= toDate('{from_date}')
+"""
+
+
+def build_risk_scores(client, cutoff: str, update_from: str):
+    client.command(_RISK_BASELINE_DDL.format(risk_table=tables.risk_baseline))
+
+    for dim, col in [
+        ("country",      "country"),
+        ("campaign",     "campaign"),
+        ("media_source", "media_source"),
+        ("app_version",  "app_version"),
+    ]:
+        client.command(_RISK_INSERT_SQL.format(
+            risk_table=tables.risk_baseline,
+            feature_table=tables.feature_store,
+            dim=dim, col=col, cutoff=cutoff,
+        ))
+        logger.info(f"[risk] Built baseline for {dim}")
+
+    for col in ["country", "campaign", "media_source", "app_version"]:
+        client.command(_RISK_UPDATE_SQL.format(
+            risk_table=tables.risk_baseline,
+            feature_table=tables.feature_store,
+            col=col, from_date=update_from,
+        ))
+        logger.info(f"[risk] Updated {col}_uninstall_rate")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _snapshot_dates(date_from: str, date_to: str, step: int) -> List[str]:
+    d   = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    dates = []
+    while d <= end:
+        dates.append(d.isoformat())
+        d += timedelta(days=step)
+    return dates
+
+
+def build_snapshot(client, snap: str, dry_run: bool = False, force: bool = False):
+    existing = client.query(
+        f"SELECT count() FROM {tables.feature_store} FINAL "
+        f"WHERE snapshot_date = toDate('{snap}')"
+    ).result_rows[0][0]
+    if existing > 0 and not force and not dry_run:
+        logger.info(f"[{snap}] Đã có {existing:,} rows, skip (dùng --force để ghi đè)")
+        return
+
+    sql = build_feature_sql(snap)
+
+    if dry_run:
+        print(sql[:3000])
+        print("... (dry run, SQL truncated)")
+        return
+
+    logger.info(f"[{snap}] Building features...")
+    client.command(sql, settings={"max_memory_usage": 32_000_000_000})
+
+    count      = client.query(
+        f"SELECT count() FROM {tables.feature_store} FINAL "
+        f"WHERE snapshot_date = toDate('{snap}')"
+    ).result_rows[0][0]
+    label_rate = client.query(
+        f"SELECT avg(label_uninstall_7d) FROM {tables.feature_store} FINAL "
+        f"WHERE snapshot_date = toDate('{snap}')"
+    ).result_rows[0][0]
+    logger.info(f"[{snap}] Done: {count:,} users | uninstall_rate={label_rate:.1%}")
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Build Android Music v2 Feature Store")
+    parser.add_argument("--snapshot_date", type=str, default=None)
+    parser.add_argument("--date_from",     type=str, default=None)
+    parser.add_argument("--date_to",       type=str, default=None)
+    parser.add_argument("--step",          type=int, default=7)
+    parser.add_argument("--init_tables",   action="store_true")
+    parser.add_argument("--build_risk",    action="store_true")
+    parser.add_argument("--risk_cutoff",   type=str, default=None)
+    parser.add_argument("--force",         action="store_true")
+    parser.add_argument("--dry_run",       action="store_true")
+    args = parser.parse_args()
+
+    client = get_client()
+
+    if args.init_tables:
+        create_tables(client)
+        logger.info("Tables created.")
+        if not (args.snapshot_date or args.date_from):
+            return
+
+    if args.snapshot_date:
+        snaps = [args.snapshot_date]
+    elif args.date_from and args.date_to:
+        snaps = _snapshot_dates(args.date_from, args.date_to, args.step)
+    else:
+        snaps = [(date.today() - timedelta(days=1)).isoformat()]
+
+    logger.info(f"Building {len(snaps)} snapshots: {snaps[0]} → {snaps[-1]}")
+    for snap in snaps:
+        try:
+            build_snapshot(client, snap, dry_run=args.dry_run, force=args.force)
+        except Exception as e:
+            logger.error(f"[{snap}] FAILED: {e}")
+
+    if args.build_risk:
+        cutoff = args.risk_cutoff or snaps[0]
+        build_risk_scores(client, cutoff=cutoff, update_from=snaps[0])
+
+
+if __name__ == "__main__":
+    main()
