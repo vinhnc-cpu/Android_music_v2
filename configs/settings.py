@@ -45,9 +45,12 @@ tables = TableConfig()
 # Model & Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-LABEL_HORIZON       = 7    # ngày dự báo uninstall
-FEATURE_WINDOW      = 30   # ngày lịch sử để tính feature
-MAX_INSTALL_AGE_DAYS = 30  # chỉ dự đoán user cài trong 30 ngày gần nhất (D0-D30 early-churn)
+LABEL_HORIZON        = 7    # ngày dự báo uninstall
+FEATURE_WINDOW       = 30   # ngày lịch sử để tính feature
+MAX_INSTALL_AGE_DAYS = 30   # chỉ dự đoán user cài trong 30 ngày gần nhất (D0-D30 early-churn)
+
+# Milestones (ngày sau install) dùng cho milestone-based feature store
+MILESTONES: List[int] = [1, 7, 14, 21, 28]
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
 

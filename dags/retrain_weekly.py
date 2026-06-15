@@ -33,21 +33,16 @@ default_args = {
 
 
 def _build_features_4w(**context) -> None:
-    from features.build_feature_store import get_client, build_snapshot
+    from features.build_feature_store import get_client, build_milestone_snapshot
+    from configs.settings import MILESTONES
 
     snap_to   = (context["dag_run"].conf or {}).get("snapshot_date") or context["ds"]
     snap_from = (date.fromisoformat(snap_to) - timedelta(days=28)).isoformat()
 
-    # Daily snapshots để không bỏ sót user cài giữa 2 snapshot weekly
-    d, end, snaps = date.fromisoformat(snap_from), date.fromisoformat(snap_to), []
-    while d <= end:
-        snaps.append(d.isoformat())
-        d += timedelta(days=1)
-
-    logger.info(f"[dag] build_features_4w: {snap_from} → {snap_to} ({len(snaps)} snaps)")
+    logger.info(f"[dag] build_features_4w: {snap_from} → {snap_to}, milestones={MILESTONES}")
     client = get_client()
-    for snap in snaps:
-        build_snapshot(client, snap)
+    for milestone in MILESTONES:
+        build_milestone_snapshot(client, milestone, snap_from, snap_to)
 
 
 def _build_risk(**context) -> None:

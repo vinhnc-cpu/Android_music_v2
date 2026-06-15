@@ -24,14 +24,13 @@ services:
     <<: *ml
     command: python -m features.build_feature_store --init_tables
 
-  # ── 2. Build features (nhiều snapshots) ─────────────────────────────────────
+  # ── 2. Build features (milestone mode — mỗi user tối đa 5 rows, không ghost row) ──
   build-features:
     <<: *ml
     command: >
       python -m features.build_feature_store
-      --date_from 2026-04-07
-      --date_to 2026-06-08
-      --step 1
+      --install_from 2026-04-07
+      --install_to 2026-06-08
 
   # ── 3. Tính risk scores (target encoding) ───────────────────────────────────
   build-risk:
